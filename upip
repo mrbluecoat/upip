@@ -1,0 +1,149 @@
+#! /bin/bash
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root or with sudo"
+  exit 1
+fi
+if [ "$1" = "init" ]; then
+  echo "Please wait, this may take a while..."
+  test -d /etc/firehol/ipsets || mkdir -p /etc/firehol/ipsets
+  test -d /etc/firehol/cache || mkdir -p /etc/firehol/cache
+  curl -sLo /etc/firehol/cache/all-ipsets.json https://iplists.firehol.org/all-ipsets.json
+  cat /etc/firehol/cache/all-ipsets.json | jq -r '.[] | .ipset' | sort -u > /etc/firehol/cache/all-ipsets.txt
+  test -f /etc/firehol/cache/public-ipsets.txt && rm /etc/firehol/cache/public-ipsets.txt
+  echo "{" > /etc/firehol/cache/public-ipsets.json
+  for LIST in $(cat /etc/firehol/cache/all-ipsets.txt)
+  do
+    META=$(curl -sL "https://iplists.firehol.org/${LIST}.json")
+    CATEGORY=$(echo "${META}" | jq -r .category)
+    CHILDREN=$(echo "${META}" | jq -r .info | grep -o '(includes:.*)' | sed 's/(includes: \|)//g')
+    URL=$(echo "${META}" | jq -r .file_local)
+    test -n "${URL}" && echo "${LIST}" >> /etc/firehol/cache/public-ipsets.txt && echo "  \"${LIST}\":{\"category\":\"${CATEGORY}\",\"children\":\"${CHILDREN}\",\"url\":\"${URL}\"}," >> /etc/firehol/cache/public-ipsets.json
+  done
+  sed -i '$ s/.$//' /etc/firehol/cache/public-ipsets.json
+  echo "}" >> /etc/firehol/cache/public-ipsets.json
+elif [ "$1" = "list" ]; then
+  INSTALLED=$(ls /etc/firehol/ipsets/*set 1> /dev/null 2>&1 && ls /etc/firehol/ipsets/*set | xargs -n1 basename | cut -d'.' -f1)
+  CUSTOM=$(comm -13 /etc/firehol/cache/public-ipsets.txt <(echo "${INSTALLED}"))
+  # get included children lists
+  test -f /tmp/included-children && rm /tmp/included-children
+  for LIST in $(echo "${INSTALLED}" | paste -sd' ')
+  do
+    if [[ ${CUSTOM} != *"${LIST}"* ]]; then
+      CHILDREN=$(cat /etc/firehol/cache/public-ipsets.json | jq -r ."${LIST}".children)
+      if [ -n "${CHILDREN}" ]; then
+        echo "${CHILDREN}" | tr ' ' '\n' >> /tmp/included-children
+        # get included sub-children lists (TODO: get fancy recursive function; for now, since sub-level check)
+        for LIST in $(cat /tmp/included-children | paste -sd' ')
+        do
+          if [[ ${CUSTOM} != *"${LIST}"* ]]; then
+            CHILDREN=$(cat /etc/firehol/cache/public-ipsets.json | jq -r ."${LIST}".children)
+          if [ -n "${CHILDREN}" ]; then
+            echo "${CHILDREN}" | tr ' ' '\n' >> /tmp/included-children
+          fi
+        fi
+        done
+      fi
+    fi
+  done
+  # get installed and included lists
+  INCLUDED=$(test -f /tmp/included-children && cat /tmp/included-children)
+  for LIST in $(cat /etc/firehol/cache/public-ipsets.txt)
+  do
+    if [[ ${INSTALLED} == *"${LIST}"* ]]; then
+      echo "INSTALLED  ${LIST}"
+    elif [[ ${INCLUDED} == *"${LIST}"* ]]; then
+      echo "INCLUDED   ${LIST}"
+    else
+      echo "           ${LIST}"
+    fi
+  done
+  if [ -n "${CUSTOM}" ]; then
+    for LIST in ${CUSTOM}
+    do
+      echo "CUSTOM     ${LIST}"
+    done
+  fi
+elif [ "$1" = "add" ] && [ -n "$2" ]; then
+  FULL=$(cat /etc/firehol/cache/public-ipsets.txt)
+  if [[ "$2" == *.* ]] && [ -n "$3" ] && [[ "$3" == http* ]]; then
+    # custom list
+    FILE="$2"
+    LIST=$(echo "${FILE}" | cut -d'.' -f1)
+    URL="$3"
+    echo "Adding ${LIST}..."
+    curl -sLo "/etc/firehol/ipsets/${FILE}" "${URL}"
+    IPTYPE=$(cat /etc/firehol/ipsets/${FILE} | grep -q "::" && echo "6" || echo "4")
+    SETTYPE=$( [[ ${FILE} == *.netset ]] && echo "net" || echo "ip" )
+    sed -i "s/# blacklists go here/ipset${IPTYPE} create ${LIST} hash:${SETTYPE}\nipset${IPTYPE} addfile ${LIST} \/etc\/firehol\/ipsets\/${FILE}\nblacklist${IPTYPE} full nolog ipset:${LIST} except src ipset:whitelist${IPTYPE}\n# blacklists go here/" /etc/firehol/firehol.conf
+    echo "$URL" > "/etc/firehol/cache/${LIST}.url"
+    firehol restart > /dev/null
+  else
+    # official Firehol list
+    LISTS=($(echo "$@" | sed 's/^add //' | sed -e 's/^[[:space:]]*//'))
+    for LIST in "${LISTS[@]}"
+    do
+      if [ -n "${LIST}" ] && [ ! -f /etc/firehol/ipsets/${LIST}.*set ] && [[ ${FULL} == *"${LIST}"* ]]; then
+        URL=$(cat /etc/firehol/cache/public-ipsets.json | jq -r ."${LIST}".url)
+        UPDATED=$(curl -sL "https://iplists.firehol.org/${LIST}.json" | jq -r .updated)
+        if [ -n "${URL}" ] && [ -n "${UPDATED}" ]; then
+          echo "Adding ${LIST}..."
+          FILE=$(basename "${URL}")
+          curl -sLo "/etc/firehol/ipsets/${FILE}" "${URL}"
+          IPTYPE=$(cat /etc/firehol/ipsets/${FILE} | grep -q "::" && echo "6" || echo "4")
+          SETTYPE=$( [[ ${FILE} == *.netset ]] && echo "net" || echo "ip" )
+          sed -i "s/# blacklists go here/ipset${IPTYPE} create ${LIST} hash:${SETTYPE}\nipset${IPTYPE} addfile ${LIST} \/etc\/firehol\/ipsets\/${FILE}\nblacklist${IPTYPE} full nolog ipset:${LIST} except src ipset:whitelist${IPTYPE}\n# blacklists go here/" /etc/firehol/firehol.conf
+          echo "${UPDATED}" > /etc/firehol/cache/${LIST}.timestamp
+        fi
+      else
+        echo "Error: ${LIST} already installed or not recognized"
+        exit 1
+      fi
+    done
+    firehol restart > /dev/null
+  fi
+elif [ "$1" = "remove" ] && [ -n "$2" ]; then
+  LISTS=($(echo "$@" | sed 's/^remove //' | sed -e 's/^[[:space:]]*//'))
+  for LIST in "${LISTS[@]}"
+  do
+    if [ -n "${LIST}" ] && [ -f /etc/firehol/ipsets/${LIST}.*set ]; then
+      test -f "/etc/firehol/cache/${LIST}.timestamp" && rm "/etc/firehol/cache/${LIST}.timestamp"
+      test -f "/etc/firehol/cache/${LIST}.url" && rm "/etc/firehol/cache/${LIST}.url"
+      test -f "/etc/firehol/ipsets/${LIST}.ipset" && rm "/etc/firehol/ipsets/${LIST}.ipset"
+      test -f "/etc/firehol/ipsets/${LIST}.netset" && rm "/etc/firehol/ipsets/${LIST}.netset"
+      test -n "$2" && sed -i "/${LIST}/d" /etc/firehol/firehol.conf
+      echo "Removed ${LIST}"
+    else
+      echo "Error: ${LIST} not installed or not recognized"
+      exit 1
+    fi
+  done
+  firehol restart > /dev/null
+elif [ "$1" = "update" ]; then
+  INSTALLED=$(ls /etc/firehol/ipsets/*set 1> /dev/null 2>&1 && ls /etc/firehol/ipsets/*set | xargs -n1 basename | cut -d'.' -f1)
+  for LIST in $(echo "${INSTALLED}" | paste -sd' ')
+  do
+    if [ -f /etc/firehol/cache/${LIST}.url ]; then
+      FILE=$(test -f /etc/firehol/ipsets/${LIST}.ipset && echo "${LIST}.ipset" || echo "${LIST}.netset")
+      URL=$(cat /etc/firehol/cache/${LIST}.url)
+      TIMESTAMP=$(date -r /etc/firehol/cache/${LIST}.url +%s)
+      NOW=$(date +%s)
+      let HOURSOLD=(NOW-TIMESTAMP)/3600
+      # custom lists don't generally provide timestamp metadata so use a hard-coded lower limit of 12 hours
+      if (( ${HOURSOLD} >= 12 )) && [ -n "${URL}" ]; then
+        curl -sLo "/etc/firehol/ipsets/${FILE}" "${URL}"
+        touch /etc/firehol/cache/${LIST}.url
+      fi
+    elif [ -f /etc/firehol/cache/${LIST}.timestamp ]; then
+      URL=$(cat /etc/firehol/cache/public-ipsets.json | jq -r ."${LIST}".url)
+      FILE=$(basename "${URL}")
+      TIMESTAMP=$(cat /etc/firehol/cache/${LIST}.timestamp)
+      UPDATED=$(curl -sL "https://iplists.firehol.org/${LIST}.json" | jq -r .updated)
+      if (( ${UPDATED} > ${TIMESTAMP} )); then
+        curl -sLo "/etc/firehol/ipsets/${FILE}" "${URL}"
+        echo "${UPDATED}" > /etc/firehol/cache/${LIST}.timestamp
+      fi
+    fi
+  done
+else
+  printf "Usage: upip [OPTION]\n\nOptions:\n  help                  this document\n  init                  initialize local data from https://iplists.firehol.org/\n  list                  show all installed and available lists\n  add [NAME(s)]         add an official list to the local Firehol instance\n  add [FILENAME] [URL]  add a custom public list to the local Firehol instance\n  remove [NAME(s)]      remove a list from the local Firehol instance\n  update                refresh local lists with latest version from external sources\n"
+fi
